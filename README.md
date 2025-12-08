@@ -67,7 +67,7 @@ To train EditThinker, we constructed ThinkEdit-140k. We employ reinforcement lea
 
 
 
-### **2. More Visualizations **
+### **2. More Visualizations**
 
 <p align="center">
   <img src="images/vis_all.png" width="90%">
