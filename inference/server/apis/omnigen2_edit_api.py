@@ -1,0 +1,735 @@
+#!/usr/bin/env python3
+"""
+OmniGen2 图像编辑API服务器
+基于edit_api_server.py的GPU管理器，提供图像编辑REST API接口
+"""
+
+import os
+import sys
+import time
+import base64
+import io
+import json
+import random
+import numpy as np
+import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import torch.multiprocessing as mp
+from multiprocessing import Process, Queue, Event
+import atexit
+import signal
+from typing import Optional, Dict, Any, List
+from pydantic import BaseModel, Field
+
+# FastAPI相关导入
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
+from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
+import uvicorn
+from PIL import Image
+
+# 设置多进程启动方法
+mp.set_start_method('spawn', force=True)
+
+# Add OmniGen2 to Python path
+# Please replace with your own OmniGen2 installation path
+omnigen2_path = "/path/to/omnigen2/"  # Replace with your OmniGen2 path
+if omnigen2_path not in sys.path:
+    sys.path.insert(0, omnigen2_path)
+
+# Import OmniGen2 related modules
+from omnigen2.pipelines.omnigen2.pipeline_omnigen2 import OmniGen2Pipeline
+from omnigen2.models.transformers.transformer_omnigen2 import OmniGen2Transformer2DModel
+from transformers import CLIPProcessor
+import torch
+
+# Configuration parameters
+# Please replace with your own model path
+model_repo_id = "/path/to/OmniGen2"  # Replace with your OmniGen2 model path
+
+MAX_SEED = np.iinfo(np.int32).max
+MAX_IMAGE_SIZE = 2048
+
+NUM_GPUS_TO_USE = int(os.environ.get("NUM_GPUS_TO_USE", torch.cuda.device_count()))  
+TASK_QUEUE_SIZE = int(os.environ.get("TASK_QUEUE_SIZE", 100))  
+TASK_TIMEOUT = int(os.environ.get("TASK_TIMEOUT", 300))
+
+print(f"配置信息: 使用 {NUM_GPUS_TO_USE} 个GPU，队列大小 {TASK_QUEUE_SIZE}，超时时间 {TASK_TIMEOUT} 秒")
+
+
+# ============== GPU管理器类（适配 OmniGen2 图像编辑） ==============
+class OmniGen2EditGPUWorker:
+    def __init__(self, gpu_id, model_repo_id, task_queue, result_queue, stop_event):
+        self.gpu_id = gpu_id
+        self.model_repo_id = model_repo_id
+        self.task_queue = task_queue
+        self.result_queue = result_queue
+        self.stop_event = stop_event
+        self.device = f"cuda:{gpu_id}"
+        self.pipe = None
+        
+    def initialize_model(self):
+        """在指定GPU上初始化 OmniGen2 图像编辑模型"""
+        try:
+            torch.cuda.set_device(self.gpu_id)
+            
+            if not os.path.exists(self.model_repo_id):
+                print(f"错误: 模型路径不存在 {self.model_repo_id}")
+                return False
+            
+            if torch.cuda.is_available():
+                torch_dtype = torch.bfloat16
+            else:
+                torch_dtype = torch.float32
+            
+            print(f"GPU {self.gpu_id} 正在加载 OmniGen2Pipeline...")
+            
+            # 加载 OmniGen2Pipeline
+            self.pipe = OmniGen2Pipeline.from_pretrained(
+                self.model_repo_id,
+                processor=CLIPProcessor.from_pretrained(
+                    self.model_repo_id,
+                    subfolder="processor",
+                    use_fast=True
+                ),
+                torch_dtype=torch_dtype,
+                trust_remote_code=True,
+            )
+            
+            # 加载 Transformer
+            self.pipe.transformer = OmniGen2Transformer2DModel.from_pretrained(
+                self.model_repo_id,
+                subfolder="transformer",
+                torch_dtype=torch_dtype,
+            )
+            
+            # 移动到指定 GPU
+            self.pipe = self.pipe.to(self.device)
+            
+            print(f"GPU {self.gpu_id} OmniGen2 图像编辑模型初始化成功")
+            return True
+        except Exception as e:
+            print(f"GPU {self.gpu_id} OmniGen2 图像编辑模型初始化失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def process_task(self, task):
+        """处理单个编辑任务"""
+        try:
+            task_id = task['task_id']
+            image_bytes = task['image_bytes']  # 字节数据
+            image = bytes_to_image(image_bytes)  # 转换为PIL Image
+            prompt = task['prompt']
+            seed = task['seed']
+            text_guidance_scale = task.get('text_guidance_scale', 5.0)
+            image_guidance_scale = task.get('image_guidance_scale', 2.0)
+            num_inference_steps = task['num_inference_steps']
+            negative_prompt = task.get('negative_prompt', '')
+            
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+            
+            # 获取原始图像尺寸
+            original_width, original_height = image.size
+            
+            # 将尺寸对齐到 16 的倍数
+            width = (original_width // 16) * 16
+            height = (original_height // 16) * 16
+
+            negative_prompt = [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant.",
+                },
+                {"role": "user", "content": negative_prompt},
+            ]
+            negative_prompt = self.pipe.processor.tokenizer.apply_chat_template(
+                negative_prompt, tokenize=False, add_generation_prompt=False
+            )
+
+            negative_prompt_embeds, negative_prompt_attention_mask = self.pipe._get_qwen2_prompt_embeds(
+                prompt=negative_prompt, device=self.device, max_sequence_length=1024
+            )
+            
+            with torch.cuda.device(self.gpu_id):
+                with torch.inference_mode():
+                    results = self.pipe(
+                        prompt=prompt,
+                        input_images=[image],  # OmniGen2 需要列表格式
+                        width=width,
+                        height=height,
+                        align_res=True,  # 对齐到输入图像分辨率
+                        num_inference_steps=num_inference_steps,
+                        max_sequence_length=1024,
+                        text_guidance_scale=text_guidance_scale,
+                        image_guidance_scale=image_guidance_scale,
+                        cfg_range=(0.0, 1.0),
+                        negative_prompt_embeds=negative_prompt_embeds,
+                        negative_prompt_attention_mask=negative_prompt_attention_mask,
+                        num_images_per_prompt=1,
+                        generator=generator,
+                        output_type="pil",
+                    )
+                    
+                    output = results.images[0]
+                    
+                    # 如果尺寸被调整过，恢复到原始尺寸
+                    if width != original_width or height != original_height:
+                        output = output.resize((original_width, original_height), Image.LANCZOS)
+            
+            return {
+                'task_id': task_id,
+                'image': output,
+                'success': True,
+                'gpu_id': self.gpu_id
+            }
+        except Exception as e:
+            import traceback
+            error_trace = traceback.format_exc()
+            print(f"GPU {self.gpu_id} 处理任务失败: {e}\n{error_trace}")
+            return {
+                'task_id': task_id,
+                'success': False,
+                'error': str(e),
+                'gpu_id': self.gpu_id
+            }
+    
+    def run(self):
+        """Worker主循环"""
+        if not self.initialize_model():
+            return
+        
+        print(f"GPU {self.gpu_id} OmniGen2编辑worker 启动")
+        
+        while not self.stop_event.is_set():
+            try:
+                # 从任务队列获取任务，设置超时以检查停止事件
+                task = self.task_queue.get(timeout=1)
+                if task is None:  # 毒丸，退出信号
+                    break
+                
+                # 处理任务
+                result = self.process_task(task)
+                
+                # 将结果放入结果队列
+                self.result_queue.put(result)
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"GPU {self.gpu_id} OmniGen2编辑worker 异常: {e}")
+                continue
+        
+        print(f"GPU {self.gpu_id} OmniGen2编辑worker 停止")
+
+
+# 全局GPU worker函数，用于spawn模式
+def omnigen2_edit_gpu_worker_process(gpu_id, model_repo_id, task_queue, result_queue, stop_event):
+    worker = OmniGen2EditGPUWorker(gpu_id, model_repo_id, task_queue, result_queue, stop_event)
+    worker.run()
+
+
+class MultiGPUOmniGen2EditManager:
+    def __init__(self, model_repo_id, num_gpus=None, task_queue_size=100):
+        self.model_repo_id = model_repo_id
+        self.num_gpus = num_gpus or torch.cuda.device_count()
+        self.task_queue = Queue(maxsize=task_queue_size)  
+        self.result_queue = Queue()  
+        self.stop_event = Event()
+        self.workers = []
+        self.worker_processes = []
+        self.task_counter = 0
+        self.pending_tasks = {}  
+        self.pending_tasks_lock = threading.Lock()
+        
+        print(f"初始化多GPU OmniGen2图像编辑管理器，使用 {self.num_gpus} 个GPU，队列大小 {task_queue_size}")
+        
+    def start_workers(self):
+        """启动所有GPU workers"""
+        for gpu_id in range(self.num_gpus):
+            process = Process(target=omnigen2_edit_gpu_worker_process, 
+                            args=(gpu_id, self.model_repo_id, self.task_queue, 
+                                  self.result_queue, self.stop_event))
+            process.start()
+            
+            self.worker_processes.append(process)
+        
+        # 启动结果处理线程
+        self.result_thread = threading.Thread(target=self._process_results)
+        self.result_thread.daemon = True
+        self.result_thread.start()
+        
+        print(f"所有 {self.num_gpus} 个GPU OmniGen2编辑workers 已启动")
+    
+    def _process_results(self):
+        """后台线程处理结果"""
+        while not self.stop_event.is_set():
+            try:
+                result = self.result_queue.get(timeout=1)
+                task_id = result['task_id']
+                
+                event_to_set = None
+                with self.pending_tasks_lock:
+                    if task_id in self.pending_tasks:
+                        # 将结果传递给等待的任务
+                        self.pending_tasks[task_id]['result'] = result
+                        event_to_set = self.pending_tasks[task_id]['event']
+                if event_to_set:
+                    event_to_set.set()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"结果处理线程异常: {e}")
+                continue
+    
+    def submit_task(self, image, prompt, seed=42, 
+                   text_guidance_scale=5.0, image_guidance_scale=2.0,
+                   num_inference_steps=50, negative_prompt='', timeout=300):
+        """提交编辑任务并等待结果"""
+        with self.pending_tasks_lock:
+            task_id = f"omnigen2_edit_task_{self.task_counter}_{time.time()}"
+            self.task_counter += 1
+        
+        # 将PIL图像转换为字节数据以便跨进程传递
+        image_bytes = image_to_bytes(image) if hasattr(image, 'save') else image
+        
+        task = {
+            'task_id': task_id,
+            'image_bytes': image_bytes,
+            'prompt': prompt,
+            'seed': seed,
+            'text_guidance_scale': text_guidance_scale,
+            'image_guidance_scale': image_guidance_scale,
+            'num_inference_steps': num_inference_steps,
+            'negative_prompt': negative_prompt,
+        }
+        
+        # 创建等待事件
+        result_event = threading.Event()
+        with self.pending_tasks_lock:
+            self.pending_tasks[task_id] = {
+                'event': result_event,
+                'result': None,
+                'submitted_time': time.time()
+            }
+        
+        try:
+            # 将任务放入队列
+            self.task_queue.put(task, timeout=10)
+            
+            # 等待结果
+            start_time = time.time()
+            if result_event.wait(timeout=timeout):
+                with self.pending_tasks_lock:
+                    result = self.pending_tasks.get(task_id, {}).get('result')
+                    if task_id in self.pending_tasks:
+                        del self.pending_tasks[task_id]
+                return result if result is not None else {'success': False, 'error': '未知错误'}
+            else:
+                # 超时
+                with self.pending_tasks_lock:
+                    if task_id in self.pending_tasks:
+                        del self.pending_tasks[task_id]
+                return {'success': False, 'error': '任务超时'}
+                
+        except queue.Full:
+            with self.pending_tasks_lock:
+                if task_id in self.pending_tasks:
+                    del self.pending_tasks[task_id]
+            return {'success': False, 'error': '任务队列已满'}
+        except Exception as e:
+            with self.pending_tasks_lock:
+                if task_id in self.pending_tasks:
+                    del self.pending_tasks[task_id]
+            return {'success': False, 'error': str(e)}
+    
+    def get_queue_status(self):
+        """获取队列状态"""
+        with self.pending_tasks_lock:
+            pending_count = len(self.pending_tasks)
+        return {
+            'task_queue_size': self.task_queue.qsize(),
+            'result_queue_size': self.result_queue.qsize(),
+            'pending_tasks': pending_count,
+            'active_workers': len(self.worker_processes),
+            'total_gpus': self.num_gpus
+        }
+    
+    def stop(self):
+        """停止所有workers"""
+        print("停止多GPU OmniGen2编辑管理器...")
+        self.stop_event.set()
+        
+        # 向每个worker发送停止信号
+        for _ in range(self.num_gpus):
+            try:
+                self.task_queue.put(None, timeout=1)
+            except queue.Full:
+                pass
+        
+        # 等待所有进程结束
+        for process in self.worker_processes:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+        
+        print("多GPU OmniGen2编辑管理器已停止")
+
+
+# ============== API相关类和函数 ==============
+
+# 全局GPU管理器实例
+gpu_manager = None
+
+def initialize_gpu_manager():
+    """初始化全局GPU管理器"""
+    global gpu_manager
+    if gpu_manager is None:
+        try:
+            if torch.cuda.is_available():
+                print(f"检测到 {torch.cuda.device_count()} 个GPU")
+            
+            gpu_manager = MultiGPUOmniGen2EditManager(
+                model_repo_id, 
+                num_gpus=NUM_GPUS_TO_USE,
+                task_queue_size=TASK_QUEUE_SIZE
+            )
+            gpu_manager.start_workers()
+            print("GPU OmniGen2编辑管理器初始化成功")
+        except Exception as e:
+            print(f"GPU OmniGen2编辑管理器初始化失败: {e}")
+            import traceback
+            traceback.print_exc()
+            gpu_manager = None
+
+def image_to_base64(image: Image.Image) -> str:
+    """将PIL图像转换为base64字符串"""
+    buffer = io.BytesIO()
+    image.save(buffer, format='PNG')
+    buffer.seek(0)
+    return base64.b64encode(buffer.getvalue()).decode()
+
+def base64_to_image(base64_str: str) -> Image.Image:
+    """将base64字符串转换为PIL图像"""
+    buffer = io.BytesIO(base64.b64decode(base64_str))
+    return Image.open(buffer)
+
+def image_to_bytes(image: Image.Image) -> bytes:
+    """将PIL图像转换为字节数据（用于跨进程传递）"""
+    buffer = io.BytesIO()
+    image.save(buffer, format='PNG')
+    buffer.seek(0)
+    return buffer.getvalue()
+
+def bytes_to_image(image_bytes: bytes) -> Image.Image:
+    """将字节数据转换为PIL图像"""
+    buffer = io.BytesIO(image_bytes)
+    return Image.open(buffer)
+
+def process_uploaded_image(file_content: bytes) -> Image.Image:
+    """处理上传的图像文件"""
+    image = Image.open(io.BytesIO(file_content))
+    # 转换为RGB格式
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    
+    # 限制图像大小
+    width, height = image.size
+    if width > MAX_IMAGE_SIZE or height > MAX_IMAGE_SIZE:
+        ratio = min(MAX_IMAGE_SIZE / width, MAX_IMAGE_SIZE / height)
+        new_width = int(width * ratio)
+        new_height = int(height * ratio)
+        image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        print(f"图像已调整大小到 {new_width}x{new_height}")
+    
+    return image
+
+
+# ============== Pydantic模型 ==============
+
+class OmniGen2ImageEditRequest(BaseModel):
+    image: Optional[str] = Field(None, description="输入图像(base64编码)，与image_file二选一")
+    prompt: str = Field(..., description="编辑指令")
+    seed: Optional[int] = Field(None, description="随机种子，不提供则随机生成")
+    text_guidance_scale: Optional[float] = Field(5.0, ge=0.0, le=10.0, description="文本引导尺度")
+    image_guidance_scale: Optional[float] = Field(2.0, ge=0.0, le=10.0, description="图像引导尺度")
+    num_inference_steps: Optional[int] = Field(50, ge=1, le=100, description="推理步数")
+    negative_prompt: Optional[str] = Field("(((deformed))), blurry, over saturation, bad anatomy", description="负面提示词")
+    enhance_prompt: Optional[bool] = Field(False, description="是否增强编辑提示词")
+
+class OmniGen2ImageEditResponse(BaseModel):
+    success: bool = Field(..., description="是否成功")
+    task_id: Optional[str] = Field(None, description="任务ID")
+    original_image: Optional[str] = Field(None, description="原始图像(base64编码)")
+    edited_image: Optional[str] = Field(None, description="编辑后的图像(base64编码)")
+    seed: Optional[int] = Field(None, description="使用的随机种子")
+    original_prompt: Optional[str] = Field(None, description="原始编辑指令")
+    enhanced_prompt: Optional[str] = Field(None, description="增强后的编辑指令")
+    gpu_id: Optional[int] = Field(None, description="使用的GPU ID")
+    processing_time: Optional[float] = Field(None, description="处理时间(秒)")
+    error: Optional[str] = Field(None, description="错误信息")
+
+class SystemStatus(BaseModel):
+    active_workers: int = Field(..., description="活跃工作进程数")
+    task_queue_size: int = Field(..., description="任务队列大小")
+    result_queue_size: int = Field(..., description="结果队列大小")
+    pending_tasks: int = Field(..., description="待处理任务数")
+    total_gpus: int = Field(..., description="总GPU数量")
+    system_ready: bool = Field(..., description="系统是否就绪")
+
+
+# ============== FastAPI应用 ==============
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    # 启动时初始化GPU管理器
+    print("正在启动OmniGen2图像编辑API服务器...")
+    initialize_gpu_manager()
+    if gpu_manager is None:
+        print("警告: GPU管理器初始化失败，某些功能可能不可用")
+    else:
+        print("OmniGen2图像编辑API服务器启动完成")
+    
+    yield
+    
+    # 关闭时清理资源
+    print("正在关闭OmniGen2图像编辑API服务器...")
+    if gpu_manager:
+        gpu_manager.stop()
+    print("OmniGen2图像编辑API服务器已关闭")
+
+app = FastAPI(
+    title="OmniGen2 图像编辑API服务器",
+    description="基于OmniGen2模型的图像编辑API服务",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    lifespan=lifespan
+)
+
+@app.get("/")
+async def root():
+    """根端点"""
+    return {"message": "欢迎使用OmniGen2 图像编辑API服务器", "status": "运行中"}
+
+@app.get("/health")
+async def health_check():
+    """健康检查端点"""
+    return {
+        "status": "健康",
+        "gpu_manager_ready": gpu_manager is not None,
+        "timestamp": time.time()
+    }
+
+@app.get("/status", response_model=SystemStatus)
+async def get_system_status():
+    """获取系统状态"""
+    if gpu_manager is None:
+        raise HTTPException(status_code=503, detail="GPU管理器未初始化")
+    
+    status = gpu_manager.get_queue_status()
+    return SystemStatus(
+        active_workers=status['active_workers'],
+        task_queue_size=status['task_queue_size'],
+        result_queue_size=status['result_queue_size'],
+        pending_tasks=status['pending_tasks'],
+        total_gpus=status['total_gpus'],
+        system_ready=True
+    )
+
+@app.post("/edit", response_model=OmniGen2ImageEditResponse)
+def edit_image(request: OmniGen2ImageEditRequest):
+    """编辑图像 - 使用base64格式"""
+    
+    # 检查GPU管理器
+    if gpu_manager is None:
+        raise HTTPException(status_code=503, detail="GPU管理器未初始化")
+    
+    if not request.image:
+        raise HTTPException(status_code=400, detail="必须提供输入图像")
+    
+    start_time = time.time()
+    
+    try:
+        # 解码输入图像
+        input_image = base64_to_image(request.image)
+        original_image_b64 = request.image
+        
+        # 处理种子
+        if request.seed is None:
+            seed = random.randint(0, MAX_SEED)
+        else:
+            seed = request.seed
+        
+        # 处理编辑提示词（OmniGen2 通常不需要 prompt polish）
+        original_prompt = request.prompt
+        enhanced_prompt = original_prompt  # OmniGen2 默认不增强
+        
+        # 提交任务到GPU队列
+        result = gpu_manager.submit_task(
+            image=input_image,
+            prompt=enhanced_prompt,
+            seed=seed,
+            text_guidance_scale=request.text_guidance_scale,
+            image_guidance_scale=request.image_guidance_scale,
+            num_inference_steps=request.num_inference_steps,
+            negative_prompt=request.negative_prompt,
+            timeout=TASK_TIMEOUT,
+        )
+        
+        if result['success']:
+            # 将编辑后的图像转换为base64
+            edited_image_b64 = image_to_base64(result['image'])
+            processing_time = time.time() - start_time
+            
+            print(f"OmniGen2图像编辑成功，使用GPU {result['gpu_id']}，耗时 {processing_time:.2f} 秒")
+            
+            return OmniGen2ImageEditResponse(
+                success=True,
+                task_id=result['task_id'],
+                original_image=original_image_b64,
+                edited_image=edited_image_b64,
+                seed=seed,
+                original_prompt=original_prompt,
+                enhanced_prompt=enhanced_prompt if request.enhance_prompt else None,
+                gpu_id=result['gpu_id'],
+                processing_time=processing_time
+            )
+        else:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"OmniGen2图像编辑失败: {result['error']}"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"编辑图像时发生异常: {str(e)}"
+        print(error_msg)
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.post("/edit-upload", response_model=OmniGen2ImageEditResponse)
+def edit_image_upload(
+    image_file: UploadFile = File(..., description="输入图像文件"),
+    prompt: str = Form(..., description="编辑指令"),
+    seed: Optional[int] = Form(None, description="随机种子"),
+    text_guidance_scale: float = Form(5.0, description="文本引导尺度"),
+    image_guidance_scale: float = Form(2.0, description="图像引导尺度"),
+    num_inference_steps: int = Form(50, description="推理步数"),
+    negative_prompt: str = Form("(((deformed))), blurry, over saturation, bad anatomy", description="负面提示词"),
+    enhance_prompt: bool = Form(False, description="是否增强编辑提示词")
+):
+    """编辑图像 - 使用文件上传格式"""
+    
+    # 检查GPU管理器
+    if gpu_manager is None:
+        raise HTTPException(status_code=503, detail="GPU管理器未初始化")
+    
+    # 验证文件类型
+    if not image_file.content_type.startswith('image/'):
+        raise HTTPException(status_code=400, detail="上传的文件不是图像格式")
+    
+    start_time = time.time()
+    
+    try:
+        # 读取上传的图像文件
+        file_content = image_file.file.read()
+        input_image = process_uploaded_image(file_content)
+        
+        # 将原始图像转换为base64以便返回
+        original_image_b64 = image_to_base64(input_image)
+        
+        # 处理种子
+        if seed is None:
+            seed = random.randint(0, MAX_SEED)
+        
+        # 处理编辑提示词（OmniGen2 默认不增强）
+        enhanced_prompt = prompt
+        
+        # 提交任务到GPU队列
+        result = gpu_manager.submit_task(
+            image=input_image,
+            prompt=enhanced_prompt,
+            seed=seed,
+            text_guidance_scale=text_guidance_scale,
+            image_guidance_scale=image_guidance_scale,
+            num_inference_steps=num_inference_steps,
+            negative_prompt=negative_prompt,
+            timeout=TASK_TIMEOUT,
+        )
+        
+        if result['success']:
+            # 将编辑后的图像转换为base64
+            edited_image_b64 = image_to_base64(result['image'])
+            processing_time = time.time() - start_time
+            
+            print(f"OmniGen2图像编辑成功，使用GPU {result['gpu_id']}，耗时 {processing_time:.2f} 秒")
+            
+            return OmniGen2ImageEditResponse(
+                success=True,
+                task_id=result['task_id'],
+                original_image=original_image_b64,
+                edited_image=edited_image_b64,
+                seed=seed,
+                original_prompt=prompt,
+                enhanced_prompt=enhanced_prompt if enhance_prompt else None,
+                gpu_id=result['gpu_id'],
+                processing_time=processing_time
+            )
+        else:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"OmniGen2图像编辑失败: {result['error']}"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"编辑图像时发生异常: {str(e)}"
+        print(error_msg)
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+# ============== 启动脚本 ==============
+
+def cleanup():
+    """清理函数"""
+    if gpu_manager:
+        gpu_manager.stop()
+
+if __name__ == "__main__":
+    def signal_handler(signum, frame):
+        print(f"收到信号 {signum}，正在清理资源...")
+        cleanup()
+        exit(0)
+    
+    # 注册清理函数
+    atexit.register(cleanup)
+    
+    # 处理信号
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        # 启动服务器
+        uvicorn.run(
+            app, 
+            host="0.0.0.0", 
+            port=8007,  # 使用8007端口避免与FLUX等其他服务器冲突
+            workers=1,  # 必须为1，因为我们使用多进程GPU管理器
+            log_level="info"
+        )
+    except KeyboardInterrupt:
+        print("收到中断信号，正在清理资源...")
+        cleanup()
+    except Exception as e:
+        print(f"应用异常: {e}")
+        cleanup()
+        raise

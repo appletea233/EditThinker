@@ -1,0 +1,16 @@
+{
+  "edit_thinker_qwen3vl_sft": {
+    "file_name": "sft_train.json", 
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "images": "images"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant"
+    }
+  }
+}

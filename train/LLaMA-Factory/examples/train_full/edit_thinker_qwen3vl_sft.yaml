@@ -1,0 +1,69 @@
+### model
+# Please replace with your own model path
+model_name_or_path: /path/to/Qwen3-VL-8B-Instruct  # Replace with your model path
+# image_max_pixels: 802816
+# video_max_pixels: 100352
+# video_maxlen: 128
+# video_fps: 2
+image_max_pixels: 1048576
+video_max_pixels: 50352
+# video_maxlen: 32
+# video_fps: 2
+# trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+# finetuning_type: lora
+# lora_rank: 256
+freeze_vision_tower: true  # choices: [true, false]
+freeze_multi_modal_projector: true  # choices: [true, false]
+deepspeed: examples/deepspeed/ds_z3_config.json  # choices: [ds_z0_config.json, ds_z2_config.json, ds_z3_config.json]
+
+# onevlm_sft_image_mini,
+### dataset
+dataset: edit_thinker_qwen3vl_sft
+template: qwen3_vl
+use_fast_tokenizer: false
+cutoff_len: 16384
+overwrite_cache: true
+preprocessing_num_workers: 64
+preprocessing_batch_size: 32
+max_samples: 1000000
+# Please replace with your own tokenized cache path
+tokenized_path: /path/to/your/cache  # Replace with your tokenized cache directory
+# streaming: true
+# num_proc: 4
+# max_steps: 1000000
+
+### output
+# Please replace with your own output directory
+output_dir: /path/to/your/train_output  # Replace with your training output directory
+logging_steps: 1
+save_steps: 1000
+save_only_model: true
+plot_loss: true
+overwrite_output_dir: true
+save_total_limit: 5
+
+### train
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 1
+learning_rate: 2.0e-5
+weight_decay: 1.0e-6
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+# flash_attn: fa2
+
+### eval
+# val_size: 0.1
+# per_device_eval_batch_size: 1
+# eval_strategy: steps
+# eval_steps: 500
+
+report_to: tensorboard
+run_name: edit_thinker_qwen3vl_sft # optional

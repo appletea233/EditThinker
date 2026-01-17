@@ -1,0 +1,24 @@
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Test outputs
+test_outputs2/
+test_outputs
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and process ids
+logs/
+pids/
+qwen_generation_progress.jsonl
+qwen_generation*.jsonl
